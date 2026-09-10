@@ -1,0 +1,30 @@
+# --- python ---
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+htmlcov/
+.coverage
+
+# --- node ---
+node_modules/
+.next/
+out/
+.turbo/
+*.tsbuildinfo
+
+# --- env ---
+.env
+.env.local
+.env.*.local
+
+# --- editors / os ---
+.idea/
+.vscode/
+.DS_Store
+
+# --- docker ---
+pgdata/
