@@ -13,12 +13,20 @@ export function HealthBadge() {
     refetchInterval: 15_000,
   })
 
-  if (isPending) return <Skeleton className="h-6 w-24" />
+  if (isPending) return <Skeleton className="h-6 w-24 rounded-md" />
 
   if (isError || data?.database !== "ok") {
-    return <Badge variant="destructive">Unavailable</Badge>
+    return (
+      <Badge variant="destructive" className="gap-1.5 rounded-md">
+        <span aria-hidden className="size-1.5 shrink-0 rounded-full bg-current" />
+        Unavailable
+      </Badge>
+    )
   }
   return (
-    <Badge className="bg-emerald-600 text-white hover:bg-emerald-600">Connected</Badge>
+    <Badge variant="success" className="gap-1.5">
+      <span aria-hidden className="size-1.5 shrink-0 rounded-full bg-current" />
+      Connected
+    </Badge>
   )
 }

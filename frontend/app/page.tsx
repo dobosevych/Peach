@@ -1,8 +1,10 @@
-import Link from "next/link"
+import Link from "next/link";
+import { ArrowRight } from "lucide-react";
 
-import { HealthBadge } from "@/components/health-badge"
-import { ItemSummary } from "@/components/item-summary"
-import { Button } from "@/components/ui/button"
+import { HealthBadge } from "@/components/health-badge";
+import { ItemSummary } from "@/components/item-summary";
+import { PageHeader } from "@/components/page-header";
+import { Button } from "@/components/ui/button";
 import {
   Card,
   CardAction,
@@ -10,24 +12,24 @@ import {
   CardDescription,
   CardHeader,
   CardTitle,
-} from "@/components/ui/card"
+} from "@/components/ui/card";
 
 export default function DashboardPage() {
   return (
-    <div className="grid gap-6">
-      <div>
-        <h1 className="font-heading text-3xl font-semibold tracking-tight">Dashboard</h1>
-        <p className="mt-1 text-sm text-muted-foreground">
-          Placeholder screens. They exist to prove the browser, API and database talk to
-          each other.
-        </p>
-      </div>
+    <div className="grid gap-10">
+      <PageHeader
+        icon="🍑"
+        title="Dashboard"
+        description="Placeholder screens. They exist to prove the browser, API and database talk to each other."
+      />
 
       <div className="grid gap-4 sm:grid-cols-2">
         <Card>
           <CardHeader>
             <CardTitle>API</CardTitle>
-            <CardDescription>Readiness of the backend and its database</CardDescription>
+            <CardDescription>
+              Readiness of the backend and its database
+            </CardDescription>
             <CardAction>
               <HealthBadge />
             </CardAction>
@@ -42,14 +44,38 @@ export default function DashboardPage() {
             <CardTitle>Items</CardTitle>
             <CardDescription>The placeholder resource</CardDescription>
           </CardHeader>
-          <CardContent className="grid gap-4">
+          <CardContent className="grid gap-5">
             <ItemSummary />
-            <Button asChild variant="outline" className="justify-self-start">
-              <Link href="/items">Manage items</Link>
+            <Button
+              asChild
+              variant="outline"
+              size="lg"
+              className="justify-self-start"
+            >
+              <Link href="/items">
+                Manage items
+                <ArrowRight data-icon="inline-end" />
+              </Link>
             </Button>
           </CardContent>
         </Card>
       </div>
+
+      <section className="flex gap-3 rounded-xl bg-tint-blue p-5">
+        <span aria-hidden className="mt-0.5 text-xl leading-none">
+          💡
+        </span>
+        <div>
+          <h2 className="font-heading text-base font-semibold text-tint-blue-foreground">
+            How the pieces fit
+          </h2>
+          <p className="mt-1.5 max-w-prose text-sm text-tint-blue-foreground/85">
+          The browser talks to Next.js, Next.js talks to FastAPI over the
+          published port, and FastAPI keeps its rows in Postgres. Every card
+            above is a round trip through all three.
+          </p>
+        </div>
+      </section>
     </div>
-  )
+  );
 }

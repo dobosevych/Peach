@@ -1,6 +1,6 @@
 COMPOSE := docker compose
 
-.PHONY: help up down build logs ps migrate revision test test-backend test-frontend lint fmt clean shell-backend shell-db
+.PHONY: help up down build logs ps migrate revision test test-backend test-frontend lint fmt clean shell-backend shell-db deploy-backend destroy-backend logs-backend cert domain deploy-frontend destroy-frontend
 
 help: ## Show this help
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*?## "}; {printf "  \033[36m%-16s\033[0m %s\n", $$1, $$2}'
@@ -50,3 +50,24 @@ shell-backend: ## Shell into the backend container
 
 shell-db: ## psql into the database
 	$(COMPOSE) exec db psql -U $${POSTGRES_USER:-peach} -d $${POSTGRES_DB:-peach}
+
+deploy-backend: ## Build, push and roll the backend on ECS Fargate (ALB + RDS)
+	./scripts/deploy-backend.sh
+
+destroy-backend: ## Delete the backend stack, database included
+	./scripts/destroy-backend.sh
+
+logs-backend: ## Tail the deployed backend's CloudWatch logs
+	aws logs tail /ecs/$${PROJECT_NAME:-peach}-backend --follow --since 10m
+
+cert: ## Request + DNS-validate an HTTPS certificate: make cert DOMAIN=api.example.com
+	./scripts/domain-backend.sh cert
+
+domain: ## Put a custom domain with HTTPS in front: make domain DOMAIN=api.example.com
+	./scripts/domain-backend.sh domain
+
+deploy-frontend: ## Build the static export and ship it to S3 + CloudFront
+	./scripts/deploy-frontend.sh
+
+destroy-frontend: ## Delete the frontend stack (bucket + distribution)
+	./scripts/destroy-frontend.sh

@@ -1,0 +1,152 @@
+AWSTemplateFormatVersion: "2010-09-09"
+
+Description: >-
+  Peach frontend on CloudFront: a private S3 bucket holding the Next.js static
+  export, reachable only through the distribution. Deployed by
+  scripts/deploy-frontend.sh, which builds the site and syncs it into the bucket.
+
+  Unlike the backend, this side really is close to free - CloudFront's always-free
+  tier covers 1 TB/month out and 10M requests, and the bucket holds a few MB.
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: peach
+
+  PriceClass:
+    Type: String
+    Default: PriceClass_100
+    AllowedValues: [PriceClass_100, PriceClass_200, PriceClass_All]
+    Description: _100 is North America + Europe, and the cheapest.
+
+  DefaultRootObject:
+    Type: String
+    Default: index.html
+
+Resources:
+  # Private: no public access, no website endpoint. CloudFront reaches it with
+  # a signed request through the origin access control below.
+  Bucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      BucketName: !Sub "${ProjectName}-frontend-${AWS::AccountId}-${AWS::Region}"
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerEnforced
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+
+  BucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref Bucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: AllowCloudFrontRead
+            Effect: Allow
+            Principal:
+              Service: cloudfront.amazonaws.com
+            Action: s3:GetObject
+            Resource: !Sub "${Bucket.Arn}/*"
+            Condition:
+              StringEquals:
+                # Scoped to this distribution, so no other account's
+                # distribution can point at the bucket.
+                AWS:SourceArn: !Sub "arn:aws:cloudfront::${AWS::AccountId}:distribution/${Distribution}"
+
+  OriginAccessControl:
+    Type: AWS::CloudFront::OriginAccessControl
+    Properties:
+      OriginAccessControlConfig:
+        Name: !Sub "${ProjectName}-frontend"
+        OriginAccessControlOriginType: s3
+        SigningBehavior: always
+        SigningProtocol: sigv4
+
+  # A static export puts /items at items.html, but the browser asks for /items.
+  # S3 has no notion of "try adding .html", so the rewrite happens at the edge.
+  RewriteFunction:
+    Type: AWS::CloudFront::Function
+    Properties:
+      Name: !Sub "${ProjectName}-frontend-rewrite"
+      AutoPublish: true
+      FunctionConfig:
+        Comment: Map clean URLs onto the static export's file names
+        Runtime: cloudfront-js-2.0
+      FunctionCode: |
+        function handler(event) {
+          var request = event.request;
+          var uri = request.uri;
+          if (uri === '/') {
+            request.uri = '/index.html';
+          } else if (uri.endsWith('/')) {
+            // The export writes items.html, not items/index.html.
+            request.uri = uri.slice(0, -1) + '.html';
+          } else if (!uri.split('/').pop().includes('.')) {
+            request.uri = uri + '.html';
+          }
+          return request;
+        }
+
+  Distribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Enabled: true
+        Comment: !Sub "${ProjectName} frontend"
+        DefaultRootObject: !Ref DefaultRootObject
+        PriceClass: !Ref PriceClass
+        HttpVersion: http2and3
+        IPV6Enabled: true
+        Origins:
+          - Id: s3
+            DomainName: !GetAtt Bucket.RegionalDomainName
+            OriginAccessControlId: !GetAtt OriginAccessControl.Id
+            S3OriginConfig:
+              OriginAccessIdentity: ""
+        DefaultCacheBehavior:
+          TargetOriginId: s3
+          ViewerProtocolPolicy: redirect-to-https
+          AllowedMethods: [GET, HEAD, OPTIONS]
+          CachedMethods: [GET, HEAD]
+          Compress: true
+          # Managed-CachingOptimized: honours the Cache-Control the deploy
+          # script puts on each object, so hashed assets pin and HTML does not.
+          CachePolicyId: 658327ea-f89d-4fab-a63d-7e88639e58f6
+          FunctionAssociations:
+            - EventType: viewer-request
+              FunctionARN: !GetAtt RewriteFunction.FunctionMetadata.FunctionARN
+        CustomErrorResponses:
+          # With origin access control a missing key comes back as 403, not 404.
+          - ErrorCode: 403
+            ResponseCode: 404
+            ResponsePagePath: /404.html
+            ErrorCachingMinTTL: 10
+          - ErrorCode: 404
+            ResponseCode: 404
+            ResponsePagePath: /404.html
+            ErrorCachingMinTTL: 10
+
+Outputs:
+  SiteUrl:
+    Description: CloudFront serves this over HTTPS with its own certificate.
+    Value: !Sub "https://${Distribution.DomainName}"
+
+  BucketName:
+    Value: !Ref Bucket
+
+  DistributionId:
+    Value: !Ref Distribution
+
+  DistributionDomainName:
+    Value: !GetAtt Distribution.DomainName

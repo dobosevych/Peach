@@ -1,0 +1,540 @@
+AWSTemplateFormatVersion: "2010-09-09"
+
+Description: >-
+  Peach backend on ECS Fargate: an internet-facing ALB in front of the FastAPI
+  service, with Postgres on RDS. Deployed by scripts/deploy-backend.sh, which
+  builds and pushes the image first - the ECR repository lives outside this
+  stack because the service cannot be created until an image exists to pull.
+
+  Defaults are the cheapest shape that still matches this architecture. Of the
+  three services only RDS has a free tier (750h/month of db.t4g.micro + 20 GB,
+  12 months, new accounts): Fargate and ALB are billed from the first hour.
+  Tasks sit in public subnets on purpose - a NAT gateway would cost more than
+  everything else here put together.
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: peach
+    Description: Prefix for every resource name.
+
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: VPC that holds the load balancer, the tasks and the database.
+
+  PublicSubnetIds:
+    Type: List<AWS::EC2::Subnet::Id>
+    Description: Two or more public subnets, in different AZs, for the ALB.
+
+  PrivateSubnetIds:
+    Type: CommaDelimitedList
+    Default: ""
+    Description: >-
+      Subnets for the tasks and the database. Leave empty to reuse the public
+      subnets, which is what a default VPC gives you; tasks then need
+      AssignPublicIp=ENABLED to reach ECR. Private subnets require a NAT gateway.
+
+  ImageUri:
+    Type: String
+    Description: Fully qualified image, e.g. <account>.dkr.ecr.<region>.amazonaws.com/peach-backend:abc1234
+
+  ContainerPort:
+    Type: Number
+    Default: 8000
+
+  TaskCpu:
+    Type: String
+    Default: "256"
+    AllowedValues: ["256", "512", "1024", "2048", "4096"]
+
+  TaskMemory:
+    Type: String
+    Default: "512"
+    Description: >-
+      Must pair with TaskCpu per the Fargate CPU/memory matrix. 256/512 is the
+      smallest, and the cheapest, combination Fargate sells.
+
+  TaskCpuArchitecture:
+    Type: String
+    Default: ARM64
+    AllowedValues: [ARM64, X86_64]
+    Description: ARM64 (Graviton) is cheaper and builds natively on Apple Silicon.
+
+  DesiredCount:
+    Type: Number
+    Default: 1
+    MinValue: 1
+
+  AssignPublicIp:
+    Type: String
+    Default: ENABLED
+    AllowedValues: [ENABLED, DISABLED]
+    Description: ENABLED when the tasks sit in public subnets with no NAT gateway.
+
+  DbName:
+    Type: String
+    Default: peach
+
+  DbUsername:
+    Type: String
+    Default: peach
+
+  DbPassword:
+    Type: String
+    NoEcho: true
+    MinLength: 16
+    Description: >-
+      Generated and remembered by the deploy script. RDS forbids /, ", @ and
+      spaces here, which also keeps the composed connection URL safe to use raw.
+
+  DbInstanceClass:
+    Type: String
+    Default: db.t4g.micro
+    Description: db.t4g.micro is the free-tier eligible class - changing it starts a bill.
+
+  DbAllocatedStorage:
+    Type: Number
+    Default: 20
+    MinValue: 20
+    MaxValue: 20
+    Description: The free tier covers 20 GB. Raise MaxValue too if you outgrow it.
+
+  DbEngineVersion:
+    Type: String
+    Default: "17"
+    Description: Major version only - RDS picks the current minor.
+
+  DbBackupRetentionDays:
+    Type: Number
+    Default: 1
+    MinValue: 0
+    MaxValue: 35
+
+  AppEnv:
+    Type: String
+    Default: production
+    AllowedValues: [development, test, production]
+
+  LogLevel:
+    Type: String
+    Default: info
+
+  CorsOrigins:
+    Type: String
+    Default: "*"
+    Description: Comma-separated browser origins; set this to the deployed frontend URL.
+
+  LogRetentionDays:
+    Type: Number
+    Default: 7
+    Description: CloudWatch gives 5 GB of ingestion and storage free each month.
+
+  DomainName:
+    Type: String
+    Default: ""
+    Description: >-
+      Optional custom domain, e.g. api.example.com. Managed by
+      scripts/domain-backend.sh (make domain).
+
+  HostedZoneId:
+    Type: String
+    Default: ""
+    Description: >-
+      Route 53 zone holding DomainName. Set, the stack owns the alias record
+      pointing at the ALB; empty, you create that record wherever DNS lives.
+
+  AcmCertificateArn:
+    Type: String
+    Default: ""
+    Description: >-
+      Optional ACM certificate, in this region. When set the ALB serves HTTPS
+      on 443 and redirects plain HTTP to it. `make cert` fills this in.
+
+Conditions:
+  HasPrivateSubnets: !Not [!Equals [!Join ["", !Ref PrivateSubnetIds], ""]]
+  HasCertificate: !Not [!Equals [!Ref AcmCertificateArn, ""]]
+  HasDomain: !Not [!Equals [!Ref DomainName, ""]]
+  # Only then can the stack own the DNS record itself.
+  HasHostedZone: !And
+    - !Condition HasDomain
+    - !Not [!Equals [!Ref HostedZoneId, ""]]
+
+Resources:
+  # --- networking ---------------------------------------------------------
+
+  AlbSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: !Sub "${ProjectName} backend ALB"
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - Description: HTTP from anywhere
+          IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+        - !If
+          - HasCertificate
+          - Description: HTTPS from anywhere
+            IpProtocol: tcp
+            FromPort: 443
+            ToPort: 443
+            CidrIp: 0.0.0.0/0
+          - !Ref AWS::NoValue
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-backend-alb"
+
+  ServiceSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: !Sub "${ProjectName} backend tasks"
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - Description: Container port, from the load balancer only
+          IpProtocol: tcp
+          FromPort: !Ref ContainerPort
+          ToPort: !Ref ContainerPort
+          SourceSecurityGroupId: !Ref AlbSecurityGroup
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-backend-service"
+
+  DbSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: !Sub "${ProjectName} database"
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - Description: Postgres, from the tasks only
+          IpProtocol: tcp
+          FromPort: 5432
+          ToPort: 5432
+          SourceSecurityGroupId: !Ref ServiceSecurityGroup
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-db"
+
+  # --- database -----------------------------------------------------------
+
+  DbSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupDescription: !Sub "${ProjectName} database"
+      SubnetIds: !If
+        - HasPrivateSubnets
+        - !Ref PrivateSubnetIds
+        - !Ref PublicSubnetIds
+
+  # A starter database: single-AZ, never reachable from the internet, and torn
+  # down with the stack. Turn on MultiAZ and DeletionProtection before this
+  # holds anything you would miss.
+  Database:
+    Type: AWS::RDS::DBInstance
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      DBInstanceIdentifier: !Sub "${ProjectName}-db"
+      Engine: postgres
+      EngineVersion: !Ref DbEngineVersion
+      DBInstanceClass: !Ref DbInstanceClass
+      AllocatedStorage: !Ref DbAllocatedStorage
+      StorageType: gp2
+      StorageEncrypted: true
+      DBName: !Ref DbName
+      MasterUsername: !Ref DbUsername
+      MasterUserPassword: !Ref DbPassword
+      DBSubnetGroupName: !Ref DbSubnetGroup
+      VPCSecurityGroups: [!Ref DbSecurityGroup]
+      PubliclyAccessible: false
+      MultiAZ: false
+      AutoMinorVersionUpgrade: true
+      BackupRetentionPeriod: !Ref DbBackupRetentionDays
+      CopyTagsToSnapshot: true
+      DeletionProtection: false
+      EnablePerformanceInsights: false
+
+  # The one place the password comes back together with the endpoint. The task
+  # reads this by ARN, so the value never lands in the task definition.
+  DatabaseUrlSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub "${ProjectName}/backend/database-url"
+      Description: !Sub "SQLAlchemy async connection string for ${ProjectName}"
+      SecretString: !Sub
+        - "postgresql+asyncpg://${DbUsername}:${DbPassword}@${Endpoint}:${Port}/${DbName}"
+        - Endpoint: !GetAtt Database.Endpoint.Address
+          Port: !GetAtt Database.Endpoint.Port
+
+  # --- load balancer ------------------------------------------------------
+
+  LoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: !Sub "${ProjectName}-backend"
+      Type: application
+      Scheme: internet-facing
+      IpAddressType: ipv4
+      Subnets: !Ref PublicSubnetIds
+      SecurityGroups: [!Ref AlbSecurityGroup]
+      LoadBalancerAttributes:
+        - Key: idle_timeout.timeout_seconds
+          Value: "60"
+
+  TargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: !Sub "${ProjectName}-backend"
+      VpcId: !Ref VpcId
+      # /health is the liveness probe: it deliberately touches no dependencies,
+      # so a wobbling database does not take healthy tasks out of rotation.
+      HealthCheckPath: /health
+      HealthCheckProtocol: HTTP
+      HealthCheckIntervalSeconds: 15
+      HealthCheckTimeoutSeconds: 5
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 3
+      Matcher:
+        HttpCode: "200"
+      Port: !Ref ContainerPort
+      Protocol: HTTP
+      TargetType: ip
+      TargetGroupAttributes:
+        - Key: deregistration_delay.timeout_seconds
+          Value: "15"
+
+  # Plain HTTP stays a forward so the stack is usable without a certificate.
+  # With AcmCertificateArn set, swap this action for a redirect to 443.
+  HttpListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref LoadBalancer
+      Port: 80
+      Protocol: HTTP
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref TargetGroup
+
+  # Alias records are free, resolve straight to the ALB's addresses and, unlike
+  # a CNAME, may sit on a zone apex.
+  DnsRecord:
+    Type: AWS::Route53::RecordSet
+    Condition: HasHostedZone
+    Properties:
+      HostedZoneId: !Ref HostedZoneId
+      Name: !Ref DomainName
+      Type: A
+      AliasTarget:
+        DNSName: !GetAtt LoadBalancer.DNSName
+        HostedZoneId: !GetAtt LoadBalancer.CanonicalHostedZoneID
+        EvaluateTargetHealth: false
+
+  # A rule rather than a change of default action: the target group has to stay
+  # attached to this listener, because that association is what lets the ECS
+  # service register into it at all.
+  HttpToHttpsRule:
+    Type: AWS::ElasticLoadBalancingV2::ListenerRule
+    Condition: HasCertificate
+    Properties:
+      ListenerArn: !Ref HttpListener
+      Priority: 1
+      Conditions:
+        - Field: path-pattern
+          Values: ["/*"]
+      Actions:
+        - Type: redirect
+          RedirectConfig:
+            Protocol: HTTPS
+            Port: "443"
+            Host: "#{host}"
+            Path: "/#{path}"
+            Query: "#{query}"
+            StatusCode: HTTP_301
+
+  HttpsListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Condition: HasCertificate
+    Properties:
+      LoadBalancerArn: !Ref LoadBalancer
+      Port: 443
+      Protocol: HTTPS
+      SslPolicy: ELBSecurityPolicy-TLS13-1-2-2021-06
+      Certificates:
+        - CertificateArn: !Ref AcmCertificateArn
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref TargetGroup
+
+  # --- iam ----------------------------------------------------------------
+
+  # Used by the ECS agent to pull the image and fetch the secret.
+  ExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: {Service: ecs-tasks.amazonaws.com}
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
+      Policies:
+        - PolicyName: read-database-url
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: secretsmanager:GetSecretValue
+                Resource: !Ref DatabaseUrlSecret
+
+  # Used by the application itself. Empty apart from ECS Exec, which is what
+  # makes `aws ecs execute-command` into a running task work.
+  TaskRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: {Service: ecs-tasks.amazonaws.com}
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: ecs-exec
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ssmmessages:CreateControlChannel
+                  - ssmmessages:CreateDataChannel
+                  - ssmmessages:OpenControlChannel
+                  - ssmmessages:OpenDataChannel
+                Resource: "*"
+
+  # --- ecs ----------------------------------------------------------------
+
+  LogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      LogGroupName: !Sub "/ecs/${ProjectName}-backend"
+      RetentionInDays: !Ref LogRetentionDays
+
+  Cluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: !Ref ProjectName
+      ClusterSettings:
+        - Name: containerInsights
+          Value: disabled
+
+  TaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Sub "${ProjectName}-backend"
+      RequiresCompatibilities: [FARGATE]
+      NetworkMode: awsvpc
+      Cpu: !Ref TaskCpu
+      Memory: !Ref TaskMemory
+      RuntimePlatform:
+        CpuArchitecture: !Ref TaskCpuArchitecture
+        OperatingSystemFamily: LINUX
+      ExecutionRoleArn: !GetAtt ExecutionRole.Arn
+      TaskRoleArn: !GetAtt TaskRole.Arn
+      ContainerDefinitions:
+        - Name: backend
+          Image: !Ref ImageUri
+          Essential: true
+          PortMappings:
+            - ContainerPort: !Ref ContainerPort
+              Protocol: tcp
+          Environment:
+            - Name: APP_ENV
+              Value: !Ref AppEnv
+            - Name: LOG_LEVEL
+              Value: !Ref LogLevel
+            - Name: CORS_ORIGINS
+              Value: !Ref CorsOrigins
+          Secrets:
+            - Name: DATABASE_URL
+              ValueFrom: !Ref DatabaseUrlSecret
+          # The image entrypoint runs `alembic upgrade head` before uvicorn, so
+          # a fresh task migrates on the way up. Keep DesiredCount at 1 while
+          # that is true, or two tasks will race for the alembic lock.
+          HealthCheck:
+            Command:
+              - CMD-SHELL
+              - !Sub "curl -fsS http://localhost:${ContainerPort}/health || exit 1"
+            Interval: 15
+            Timeout: 5
+            Retries: 3
+            StartPeriod: 60
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref LogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: backend
+
+  Service:
+    Type: AWS::ECS::Service
+    # The target group has to hang off a listener before the service may
+    # register into it.
+    DependsOn: HttpListener
+    Properties:
+      ServiceName: !Sub "${ProjectName}-backend"
+      Cluster: !Ref Cluster
+      TaskDefinition: !Ref TaskDefinition
+      LaunchType: FARGATE
+      PlatformVersion: LATEST
+      DesiredCount: !Ref DesiredCount
+      EnableExecuteCommand: true
+      # Migrations run at boot, so give the first task room before the ALB
+      # starts judging it.
+      HealthCheckGracePeriodSeconds: 180
+      DeploymentConfiguration:
+        MinimumHealthyPercent: 100
+        MaximumPercent: 200
+        DeploymentCircuitBreaker:
+          Enable: true
+          Rollback: true
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: !Ref AssignPublicIp
+          SecurityGroups: [!Ref ServiceSecurityGroup]
+          Subnets: !If
+            - HasPrivateSubnets
+            - !Ref PrivateSubnetIds
+            - !Ref PublicSubnetIds
+      LoadBalancers:
+        - ContainerName: backend
+          ContainerPort: !Ref ContainerPort
+          TargetGroupArn: !Ref TargetGroup
+
+Outputs:
+  ApiUrl:
+    Description: Base URL of the backend behind the ALB.
+    Value: !If
+      - HasDomain
+      - !If [HasCertificate, !Sub "https://${DomainName}", !Sub "http://${DomainName}"]
+      - !Sub "http://${LoadBalancer.DNSName}"
+
+  LoadBalancerDns:
+    Value: !GetAtt LoadBalancer.DNSName
+
+  ClusterName:
+    Value: !Ref Cluster
+
+  ServiceName:
+    Value: !GetAtt Service.Name
+
+  DatabaseEndpoint:
+    Value: !GetAtt Database.Endpoint.Address
+
+  DatabaseUrlSecretArn:
+    Value: !Ref DatabaseUrlSecret
+
+  LogGroupName:
+    Value: !Ref LogGroup
