@@ -120,16 +120,29 @@ log "building ${IMAGE_URI} for linux/${TASK_ARCHITECTURE}"
 aws ecr get-login-password --region "${AWS_REGION}" \
   | docker login --username AWS --password-stdin "${REGISTRY}" >/dev/null
 
-docker build \
-  --platform "linux/${TASK_ARCHITECTURE}" \
-  --target runtime \
-  --tag "${IMAGE_URI}" \
-  --tag "${REGISTRY}/${ECR_REPOSITORY}:latest" \
-  "${ROOT}/backend"
+# buildx hands the image straight to the registry. That matters on an x86 CI
+# runner building for Graviton: a cross-architecture image cannot always be
+# loaded into the local daemon's store, but it can always be pushed.
+if docker buildx version >/dev/null 2>&1; then
+  docker buildx build \
+    --platform "linux/${TASK_ARCHITECTURE}" \
+    --target runtime \
+    --tag "${IMAGE_URI}" \
+    --tag "${REGISTRY}/${ECR_REPOSITORY}:latest" \
+    --push \
+    "${ROOT}/backend"
+else
+  docker build \
+    --platform "linux/${TASK_ARCHITECTURE}" \
+    --target runtime \
+    --tag "${IMAGE_URI}" \
+    --tag "${REGISTRY}/${ECR_REPOSITORY}:latest" \
+    "${ROOT}/backend"
 
-log "pushing to ECR"
-docker push --quiet "${IMAGE_URI}"
-docker push --quiet "${REGISTRY}/${ECR_REPOSITORY}:latest"
+  log "pushing to ECR"
+  docker push --quiet "${IMAGE_URI}"
+  docker push --quiet "${REGISTRY}/${ECR_REPOSITORY}:latest"
+fi
 
 # --- database password ------------------------------------------------------
 
@@ -183,7 +196,7 @@ DB_ALLOCATED_STORAGE="${DB_ALLOCATED_STORAGE:-20}" \
 DB_ENGINE_VERSION="${DB_ENGINE_VERSION:-17}" \
 APP_ENV="${APP_ENV_AWS:-production}" \
 LOG_LEVEL="${LOG_LEVEL:-info}" \
-CORS_ORIGINS="${API_CORS_ORIGINS:-*}" \
+CORS_ORIGINS="${API_CORS_ORIGINS:-}" \
 ACM_CERTIFICATE_ARN="${ACM_CERTIFICATE_ARN:-}" \
 DOMAIN_NAME="${DOMAIN_NAME:-}" \
 HOSTED_ZONE_ID="${HOSTED_ZONE_ID:-}" \
@@ -215,9 +228,19 @@ params = {
     "DomainName": os.environ["DOMAIN_NAME"],
     "HostedZoneId": os.environ["HOSTED_ZONE_ID"],
 }
+# An empty value means "leave this alone": CloudFormation reuses the stack's
+# existing value for any parameter the deploy does not mention, and falls back
+# to the template default on a brand new stack. Without this, a deploy from CI -
+# which has no .env - would quietly strip the domain, certificate and CORS
+# settings off a stack that already had them.
 with open(sys.argv[1], "w") as fh:
     json.dump(
-        [{"ParameterKey": k, "ParameterValue": v} for k, v in params.items()], fh
+        [
+            {"ParameterKey": k, "ParameterValue": v}
+            for k, v in params.items()
+            if v != ""
+        ],
+        fh,
     )
 PY
 

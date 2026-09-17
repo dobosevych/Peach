@@ -67,16 +67,22 @@ Peach/
 ├── docker-compose.override.yml   # dev: bind mounts + hot reload (auto-loaded)
 ├── Makefile                      # thin wrappers over the compose and deploy commands
 │
+├── .github/workflows/
+│   ├── lint.yml                  # ruff + eslint on every push
+│   └── deploy-backend.yml        # ships when a commit message says "deploy"
+│
 ├── infra/
 │   ├── backend.yaml              # CloudFormation: ALB + ECS Fargate + RDS
-│   └── frontend.yaml             # CloudFormation: S3 + CloudFront
+│   ├── frontend.yaml             # CloudFormation: S3 + CloudFront
+│   └── github-oidc.yaml          # CloudFormation: the role Actions assumes
 │
 ├── scripts/
 │   ├── deploy-backend.sh         # build -> ECR -> CloudFormation
 │   ├── domain-backend.sh         # ACM certificate + DNS for a custom domain
 │   ├── destroy-backend.sh        # delete the stack, database included
 │   ├── deploy-frontend.sh        # static export -> S3 -> CloudFront
-│   └── destroy-frontend.sh       # delete the bucket and distribution
+│   ├── destroy-frontend.sh       # delete the bucket and distribution
+│   └── github-role.sh            # the OIDC role CI assumes to deploy
 │
 ├── backend/
 │   ├── Dockerfile                # builder / dev / runtime stages
@@ -480,11 +486,66 @@ from that region, unlike the ALB, which wants one in its own. `make domain` hand
 only, so the frontend currently answers on its `*.cloudfront.net` name, which comes with working
 HTTPS out of the box.
 
-## 13. Where to take it next
+## 13. Deploying from GitHub Actions
+
+```bash
+make github-role      # once: create the role Actions assumes
+```
+
+Then write the word **deploy** in a commit message on `main`:
+
+```bash
+git commit -m "tighten the items query, deploy"
+git push
+```
+
+`.github/workflows/deploy-backend.yml` picks that up and runs `make deploy-backend` on a runner.
+Ordinary commits to `main` do nothing, so the expensive path stays opt-in. The workflow also has a
+`workflow_dispatch` trigger, so it can be run by hand from the Actions tab without any magic word.
+Matching is case-insensitive — GitHub compares strings that way — so `Deploy` and `redeployed`
+count too.
+
+**No access key is involved.** `make github-role` creates a stack holding an IAM role and, if the
+account does not already have one, the GitHub OIDC provider. The workflow asks GitHub for a
+short-lived token describing the run, and AWS trades it for temporary credentials. The trust policy
+accepts that token only for this repository and only for the subject below:
+
+```
+repo:<owner>/<repo>:ref:refs/heads/main
+```
+
+That restriction matters. Widening it to `repo:<owner>/<repo>:*` — via `GITHUB_SUBJECT_CLAIM` in
+`.env` — would let any branch, and any pull request from anyone who can open one, assume a role
+that can deploy. The default keeps it to `main`.
+
+The role's policy is deliberately not `AdministratorAccess`. It is scoped to the services the
+deploy actually drives, and to this project's resource names wherever the API supports it —
+several of these calls, `ecs:RegisterTaskDefinition` and the load balancer APIs among them, accept
+no resource-level permissions at all. If a CI deploy ever stops with `AccessDenied`, the missing
+action belongs in `infra/github-oidc.yaml`.
+
+**Two repository variables** carry the rest: `AWS_DEPLOY_ROLE_ARN` and `AWS_REGION`. If the `gh`
+CLI is installed and logged in, `make github-role` sets both for you; otherwise it prints them to
+paste into *Settings → Secrets and variables → Actions*. Neither is secret — the ARN is useless
+without a token minted by this repository's workflows.
+
+**CI has no `.env`, and that is fine.** Any parameter the deploy script resolves to an empty value
+is left out of the CloudFormation call, and CloudFormation then keeps whatever the stack already
+has. So a deploy from CI will not undo `make domain`, blank the certificate, or widen
+`API_CORS_ORIGINS` back to `*` — the settings you made locally survive.
+
+**The image builds under emulation.** The task definition asks for ARM64 and the runner is x86, so
+the workflow sets up QEMU and buildx pushes the cross-architecture image straight to ECR rather
+than loading it into the local daemon. Switching the job to a `ubuntu-24.04-arm` runner makes the
+build native and those two steps unnecessary.
+
+The frontend is not wired to CI — `make deploy-frontend` stays a local command for now.
+
+## 14. Where to take it next
 
 When the real domain arrives, replace the `Item` model, schemas, service, routes and the `/items`
 screen, and add an Alembic revision for the new tables. Everything else — config, database wiring,
 Compose, Dockerfiles, tooling, tests scaffolding — stays as is.
 
 The deliberate gaps, left for later: authentication and authorization, multi-tenancy, background
-workers, CI, and a custom domain for the frontend.
+workers, a custom domain for the frontend, and a CI path for the frontend deploy.
