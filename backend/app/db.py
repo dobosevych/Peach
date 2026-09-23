@@ -9,6 +9,7 @@ from sqlalchemy.ext.asyncio import (
     create_async_engine,
 )
 from sqlalchemy.orm import DeclarativeBase
+from sqlalchemy.pool import NullPool
 
 from app.config import get_settings
 
@@ -19,6 +20,8 @@ class Base(DeclarativeBase):
 
 def create_engine() -> AsyncEngine:
     settings = get_settings()
+    if not settings.db_pooling:
+        return create_async_engine(settings.database_url, echo=False, poolclass=NullPool)
     return create_async_engine(
         settings.database_url,
         echo=False,

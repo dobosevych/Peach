@@ -15,6 +15,9 @@ class Settings(BaseSettings):
     log_level: str = "info"
 
     database_url: str = "postgresql+asyncpg://peach:peach@db:5432/peach"
+    # Off on Lambda: a warm but idle execution environment would otherwise hold
+    # pooled connections open, and Aurora Serverless only pauses at zero.
+    db_pooling: bool = True
     # NoDecode keeps pydantic-settings from JSON-parsing the env value, so the
     # validator below can accept the comma-separated form Compose passes.
     cors_origins: Annotated[list[str], NoDecode] = Field(

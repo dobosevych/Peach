@@ -72,20 +72,20 @@ Peach/
 │   └── deploy-backend.yml        # ships when a commit message says "deploy"
 │
 ├── infra/
-│   ├── backend.yaml              # CloudFormation: ALB + ECS Fargate + RDS
-│   ├── frontend.yaml             # CloudFormation: S3 + CloudFront
+│   ├── backend.yaml              # CloudFormation: Lambda + function URL + Aurora Serverless v2
+│   ├── frontend.yaml             # CloudFormation: S3 + CloudFront (+ optional custom domain)
 │   └── github-oidc.yaml          # CloudFormation: the role Actions assumes
 │
 ├── scripts/
-│   ├── deploy-backend.sh         # build -> ECR -> CloudFormation
-│   ├── domain-backend.sh         # ACM certificate + DNS for a custom domain
+│   ├── deploy-backend.sh         # build -> ECR -> CloudFormation -> migrate -> BACKEND_URL in .env
 │   ├── destroy-backend.sh        # delete the stack, database included
-│   ├── deploy-frontend.sh        # static export -> S3 -> CloudFront
+│   ├── deploy-frontend.sh        # static export (against BACKEND_URL) -> S3 -> CloudFront
+│   ├── domain-frontend.sh        # us-east-1 ACM certificate + DNS for the frontend's domain
 │   ├── destroy-frontend.sh       # delete the bucket and distribution
 │   └── github-role.sh            # the OIDC role CI assumes to deploy
 │
 ├── backend/
-│   ├── Dockerfile                # builder / dev / runtime stages
+│   ├── Dockerfile                # builder / dev / runtime stages, plus lambda
 │   ├── .dockerignore
 │   ├── pyproject.toml
 │   ├── uv.lock
@@ -95,6 +95,7 @@ Peach/
 │   │   ├── main.py               # FastAPI app factory, router + middleware wiring
 │   │   ├── config.py             # Settings (pydantic-settings), cached accessor
 │   │   ├── db.py                 # async engine, session factory, get_session dependency
+│   │   ├── lambda_handler.py     # Lambda entry: function URL -> Mangum, {"action":"migrate"} -> alembic
 │   │   ├── models/
 │   │   │   ├── __init__.py
 │   │   │   └── item.py           # placeholder ORM model
@@ -349,98 +350,69 @@ The generated project was checked end to end:
 
 ## 11. Deploying the backend to AWS
 
+Everything lives in **us-east-1**, and every resource carries a `PROJECT_NAME` tag.
+
 ```bash
-make deploy-backend                       # build -> ECR -> CloudFormation -> ECS Fargate
-make domain DOMAIN=api.example.com        # custom domain + HTTPS, end to end
-make cert   DOMAIN=api.example.com        # just the certificate half
-make logs-backend                         # tail CloudWatch
-make destroy-backend                      # delete everything, database included
+make deploy-backend      # build -> ECR -> CloudFormation -> Lambda -> migrate -> BACKEND_URL in .env
+make migrate-backend     # re-run migrations alone
+make logs-backend        # tail CloudWatch
+make destroy-backend     # delete everything, database included
 ```
 
 `infra/backend.yaml` is the whole architecture in one CloudFormation stack:
 
 ```
-internet -> ALB :80 -> target group (ip) -> Fargate task :8000 -> RDS Postgres :5432
-                                                  |
-                                          Secrets Manager (DATABASE_URL)
+internet -> Lambda function URL (HTTPS) -> Lambda (FastAPI via Mangum, in the VPC) -> Aurora Serverless v2 :5432
 ```
 
-`scripts/deploy-backend.sh` drives it: it ensures the ECR repository, builds the `runtime` stage
-for `linux/arm64`, pushes it, then deploys the stack with the new image URI. The ECR repository is
-the one piece deliberately outside the template — the service cannot be created until there is an
-image for it to pull.
+`scripts/deploy-backend.sh` drives it, in order:
 
-**Before the first run** put your region and credentials in `.env` (see the `aws / deploy` block;
-`AWS_PROFILE` works instead of static keys). Everything else is optional: left blank, the script
-uses the region's default VPC and its subnets. The first deploy takes about ten minutes, almost
-all of it RDS.
+1. ensures the ECR repository, builds the Dockerfile's `lambda` stage for `linux/arm64` and pushes
+   it (with `--provenance=false`: Lambda rejects the manifest list buildx makes otherwise);
+2. deploys the stack with the new image URI;
+3. invokes the function directly with `{"action": "migrate"}`, which runs `alembic upgrade head`.
+   A function URL request can never produce that event, so only someone allowed to call
+   `lambda:InvokeFunction` can trigger it;
+4. **writes the API URL into `.env` as `BACKEND_URL`** — the function URL, always HTTPS.
+   `make deploy-frontend` builds against it, so the backend always goes first.
 
-**The database password** is generated on the first deploy and never written to disk.
-CloudFormation composes the connection string from it and the RDS endpoint into a Secrets Manager
-secret; the task reads that secret by ARN, so the password never appears in the task definition.
-Re-runs read the existing password back out of the secret rather than rotating it.
+**Before the first run** put your credentials in `.env` (`AWS_PROFILE` works instead of static
+keys). Everything else is optional: left blank, the script uses the default VPC and its subnets,
+skipping AZs Lambda cannot use (`use1-az3`). The first deploy takes about ten minutes, almost all
+of it Aurora.
 
-**Migrations** run on container boot — the image entrypoint is `alembic upgrade head` followed by
-uvicorn. That is why `ECS_DESIRED_COUNT` is 1: a second task would race the first for the Alembic
-lock. The ALB health check points at `/health`, which touches no dependencies, so a wobbling
-database never pulls a healthy task out of rotation.
+**Aurora scales to zero.** The cluster runs Aurora PostgreSQL 17.4 on one `db.serverless` instance
+with `MinCapacity: 0`: after `DB_SECONDS_UNTIL_AUTO_PAUSE` (300 s) without connections it pauses and
+bills only storage. The first request after a pause waits ~15 s while it resumes, well inside the
+function's 30 s timeout. For it to pause at all nothing may hold a connection, so on Lambda the app
+runs with `DB_POOLING=false` (SQLAlchemy `NullPool`): each request opens and closes its own
+connection instead of a warm environment keeping one open.
 
-**What it costs.** Only RDS has a free tier here, and the defaults stay inside it — `db.t4g.micro`,
-20 GB gp2, single-AZ, one-day backups: free for 750 h/month for 12 months on a new account. The
-other two bill from the first hour:
+**No NAT gateway.** The function sits in the VPC only to reach Aurora and needs nothing from the
+internet, so the default subnets do. The flip side is that it cannot reach Secrets Manager, so
+the connection string comes in as the `DATABASE_URL` environment variable. The password is
+generated on the first deploy, kept in the `peach/backend/database-url` secret, and read back
+from there on later deploys rather than rotated.
 
-| | Roughly, per month | Free tier |
+**No custom domain on the backend.** The API answers on its
+`https://<id>.lambda-url.us-east-1.on.aws` name. Only the frontend gets a custom domain (§12).
+
+**What it costs.**
+
+| | Idle | Per use |
 |---|---|---|
-| ALB | $16-20, plus a few dollars for its public IPv4 addresses | no |
-| Fargate task (256 CPU / 512 MB, ARM64) | ~$7 | no |
-| RDS `db.t4g.micro` + 20 GB | $0 for 12 months, then ~$15 | yes |
-| Secrets Manager (one secret) | $0.40 | 30-day trial |
-| ECR, CloudWatch Logs | ~$0 at this size | yes |
-
-Call it $25-30/month while the stack is up. Nothing here scales to zero, so `make destroy-backend`
-between demos is the difference between a rounding error and a real bill. Tasks run in public
-subnets on purpose: a NAT gateway would cost more than everything in the table combined.
-
-### Custom domain and HTTPS
-
-```bash
-make domain DOMAIN=api.example.com
-```
-
-One command, run once. It finds or requests an ACM certificate for the domain **in the ALB's
-region** (an ALB will not accept a certificate from anywhere else), gets it DNS-validated, records
-the ARN in `.env`, and redeploys. The stack then adds a 443 listener and a rule that 301s plain
-HTTP to HTTPS. Certificates are free and renew themselves as long as the validation record stays
-put.
-
-What happens in the middle depends on where the domain's DNS lives:
-
-- **In Route 53.** The script finds the hosted zone by longest suffix match — `api.example.com`
-  resolves to the `example.com` zone — writes the validation record itself, waits for ACM, and
-  hands `HostedZoneId` to CloudFormation. The stack then owns an A-alias record pointing at the
-  ALB. Alias records are free, resolve straight to the ALB, and unlike a CNAME may sit on a zone
-  apex. Nothing to do by hand.
-- **Anywhere else.** The script prints the validation `CNAME` and blocks until you have added it at
-  your registrar, then prints the second record to add — your domain to the ALB's hostname. A zone
-  apex cannot be a `CNAME`, so for `example.com` rather than `api.example.com` you need either
-  Route 53 or your provider's `ALIAS`/`ANAME` record; the script says so when it applies.
-
-`make cert` is the first half on its own: certificate issued and its ARN saved, nothing deployed.
-Useful when DNS lives elsewhere and you would rather get validation out of the way first. Both
-commands are safe to re-run — an existing certificate for the domain is reused, never re-requested.
-
-The certificate is deliberately not part of the stack, so `make destroy-backend` leaves it behind:
-it costs nothing, and keeping it means a later redeploy skips validation entirely. Delete it by
-hand from ACM if you want it gone.
-
-One thing the domain does not do for you: `API_CORS_ORIGINS` still says `*`. Set it to the
-frontend's real origin and `make deploy-backend` once more.
+| Lambda (512 MB, arm64) | $0 | free tier: 1M requests + 400k GB-s a month |
+| Aurora Serverless v2 | storage only, ~$0.10/GB-month | ~$0.12 per ACU-hour while awake (max 1 ACU) |
+| Secrets Manager (one secret) | $0.40 | — |
+| ECR, CloudWatch Logs | ~$0 at this size | — |
 
 ## 12. Deploying the frontend to CloudFront
 
 ```bash
-make deploy-frontend      # build the static export -> S3 -> CloudFront
-make destroy-frontend     # delete the bucket and the distribution
+make deploy-frontend                  # build the static export against BACKEND_URL -> S3 -> CloudFront
+make domain DOMAIN=app.example.com    # assign a custom domain, separately
+make cert   DOMAIN=app.example.com    # just the certificate half
+make destroy-frontend                 # delete the bucket and the distribution
 ```
 
 Every route in this app prerenders (`next build` reports them all as `○ Static`), so the frontend
@@ -459,17 +431,40 @@ small CloudFront Function rewrites `/items` and `/items/` onto the file that exi
 come back from S3 as 403 rather than 404, so both map to the exported `404.html`.
 
 **The API URL is compiled in, not read at runtime.** `NEXT_PUBLIC_*` is substituted at build time,
-so the script resolves the backend's `ApiUrl` from its stack and builds against that. Override it
-with `FRONTEND_API_URL` in `.env`. The `NEXT_PUBLIC_API_URL` further up that file stays pointed at
-localhost for Compose and is not used here.
+so the script builds against `BACKEND_URL` from `.env` — written there by `make deploy-backend` —
+and stops if it is empty. The `NEXT_PUBLIC_API_URL` further up that file stays pointed at localhost
+for Compose and is not used here.
 
-**Deploy the backend with HTTPS first.** CloudFront only serves HTTPS, and a browser will not let
-an HTTPS page call an HTTP API — the site would load and then fail every request as mixed content.
-If the backend is still on the ALB's plain-HTTP hostname the script says so and keeps going, but
-the fix is `make domain DOMAIN=api.example.com` before this.
-
-**Then let the site through CORS.** The script prints the exact line: put the CloudFront URL in
+**Then let the site through CORS.** The script prints the exact line: put the site's URL in
 `API_CORS_ORIGINS` and run `make deploy-backend` once more.
+
+### Custom domain
+
+The custom domain is the frontend's alone, and it is assigned separately: `make deploy-frontend`
+never touches the domain settings, and `make domain` touches nothing else — it does not rebuild or
+re-upload the site.
+
+```bash
+make domain DOMAIN=app.example.com
+```
+
+Run it once, after the first `make deploy-frontend`. It finds or requests an ACM certificate
+**in us-east-1** (the only region CloudFront takes certificates from), gets it DNS-validated,
+records the domain in `.env`, and updates the frontend stack with the domain. The distribution then
+answers on the domain as well as on its `*.cloudfront.net` name. Certificates are free and renew
+themselves as long as the validation record stays put.
+
+- **DNS in Route 53.** The script finds the hosted zone by longest suffix match, writes the
+  validation record itself, and hands `HostedZoneId` to CloudFormation, which then owns A and AAAA
+  alias records pointing at the distribution. Nothing to do by hand.
+- **DNS anywhere else.** The script prints the validation `CNAME` and waits for it, then prints the
+  second record — your domain to the distribution's hostname. A zone apex cannot be a `CNAME`, so
+  for `example.com` rather than `app.example.com` you need Route 53 or your provider's
+  `ALIAS`/`ANAME` record.
+
+`make cert` is the first half on its own. Both are safe to re-run. The certificate is not part of
+the stack, so `make destroy-frontend` leaves it behind. Afterwards, add `https://app.example.com`
+to `API_CORS_ORIGINS` and `make deploy-backend`.
 
 **Caching.** Hashed assets under `_next/static/` upload with `max-age=31536000,immutable` and
 without `--delete`, so a client mid-navigation can still fetch the previous build's chunks; they
@@ -477,14 +472,14 @@ cost fractions of a cent and can be pruned by hand whenever. Everything else upl
 `max-age=0,must-revalidate` and the distribution is invalidated on every deploy, so a deploy is
 visible immediately.
 
-**What it costs: about nothing.** CloudFront's always-free tier is 1 TB out and 10M requests a
-month, permanently, and the whole site is 2 MB. Invalidations are free up to 1,000 paths a month
-and this uses one per deploy. `PriceClass_100` keeps edges to North America and Europe.
-
-**A custom domain** here would need its certificate in **us-east-1** — CloudFront only reads ACM
-from that region, unlike the ALB, which wants one in its own. `make domain` handles the ALB case
-only, so the frontend currently answers on its `*.cloudfront.net` name, which comes with working
-HTTPS out of the box.
+**What it costs: nothing.** CloudFront's always-free tier is 1 TB out and 10M requests a month,
+permanently, and the whole site is 2 MB. The distribution uses nothing outside it: CloudFront
+Functions get 2M invocations free a month, invalidations are free up to 1,000 paths a month and
+this uses one per deploy, and there is no WAF, logging, Lambda@Edge, Origin Shield or dedicated
+IP. The price class is fixed at `PriceClass_100` (North America and Europe), the cheapest, should
+traffic ever outgrow the free tier. The S3 bucket holding the site costs a few cents a year. For a
+hard $0 cap rather than a free tier, CloudFront's flat-rate *Free* plan can be selected on the
+distribution in the console; there is no API for it yet.
 
 ## 13. Deploying from GitHub Actions
 
@@ -520,8 +515,7 @@ that can deploy. The default keeps it to `main`.
 
 The role's policy is deliberately not `AdministratorAccess`. It is scoped to the services the
 deploy actually drives, and to this project's resource names wherever the API supports it —
-several of these calls, `ecs:RegisterTaskDefinition` and the load balancer APIs among them, accept
-no resource-level permissions at all. If a CI deploy ever stops with `AccessDenied`, the missing
+a few, such as `ec2:CreateSecurityGroup`, accept no resource-level permissions at all. If a CI deploy ever stops with `AccessDenied`, the missing
 action belongs in `infra/github-oidc.yaml`.
 
 **Two repository variables** carry the rest: `AWS_DEPLOY_ROLE_ARN` and `AWS_REGION`. If the `gh`
@@ -531,10 +525,11 @@ without a token minted by this repository's workflows.
 
 **CI has no `.env`, and that is fine.** Any parameter the deploy script resolves to an empty value
 is left out of the CloudFormation call, and CloudFormation then keeps whatever the stack already
-has. So a deploy from CI will not undo `make domain`, blank the certificate, or widen
-`API_CORS_ORIGINS` back to `*` — the settings you made locally survive.
+has. So a deploy from CI will not widen `API_CORS_ORIGINS` back to `*` — the settings you made
+locally survive. CI also writes `BACKEND_URL` into a throwaway `.env` on the runner; locally, run
+`make deploy-backend` yourself before `make deploy-frontend`.
 
-**The image builds under emulation.** The task definition asks for ARM64 and the runner is x86, so
+**The image builds under emulation.** The function runs on arm64 and the runner is x86, so
 the workflow sets up QEMU and buildx pushes the cross-architecture image straight to ECR rather
 than loading it into the local daemon. Switching the job to a `ubuntu-24.04-arm` runner makes the
 build native and those two steps unnecessary.
@@ -548,4 +543,4 @@ screen, and add an Alembic revision for the new tables. Everything else — conf
 Compose, Dockerfiles, tooling, tests scaffolding — stays as is.
 
 The deliberate gaps, left for later: authentication and authorization, multi-tenancy, background
-workers, a custom domain for the frontend, and a CI path for the frontend deploy.
+workers, and a CI path for the frontend deploy.

@@ -2,8 +2,8 @@
 # Build the Next.js static export and put it behind CloudFront.
 #
 # The API URL is compiled into the bundle - NEXT_PUBLIC_* is substituted at
-# build time, not read at runtime - so this resolves the deployed backend URL
-# first and builds against it.
+# build time, not read at runtime - so this builds against BACKEND_URL from
+# .env, which scripts/deploy-backend.sh writes. Deploy the backend first.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -15,10 +15,14 @@ warn() { printf '\033[33m==>\033[0m %s\n' "$*" >&2; }
 die() { printf '\033[31merror:\033[0m %s\n' "$*" >&2; exit 1; }
 
 if [[ -f "${ROOT}/.env" ]]; then
+  # Variables already exported win over .env: `AWS_REGION=eu-central-1 make x`
+  # must not be quietly reset to the region .env names.
+  preset="$(export -p)"
   set -a
   # shellcheck disable=SC1091
   source "${ROOT}/.env"
   set +a
+  eval "${preset}"
 fi
 
 # A blank AWS_PROFILE is read as a profile literally named "", and blank keys
@@ -29,9 +33,7 @@ done
 
 PROJECT_NAME="${PROJECT_NAME:-peach}"
 STACK_NAME="${FRONTEND_STACK_NAME:-${PROJECT_NAME}-frontend}"
-BACKEND_STACK_NAME="${STACK_NAME_BACKEND:-${PROJECT_NAME}-backend}"
-AWS_REGION="${AWS_REGION:-${AWS_DEFAULT_REGION:-}}"
-[[ -n "${AWS_REGION}" ]] || die "AWS_REGION is not set (put it in .env)"
+AWS_REGION="${AWS_REGION:-${AWS_DEFAULT_REGION:-us-east-1}}"
 export AWS_DEFAULT_REGION="${AWS_REGION}"
 
 # --- preflight --------------------------------------------------------------
@@ -54,28 +56,16 @@ fi
 # --- which API does this build talk to? -------------------------------------
 
 # NEXT_PUBLIC_API_URL in .env points at localhost for Compose; it is not what a
-# deployed bundle should be compiled against.
-API_URL="${FRONTEND_API_URL:-}"
-if [[ -z "${API_URL}" ]]; then
-  API_URL="$(aws cloudformation describe-stacks --stack-name "${BACKEND_STACK_NAME}" \
-    --query "Stacks[0].Outputs[?OutputKey=='ApiUrl'].OutputValue" \
-    --output text 2>/dev/null || true)"
-fi
-if [[ -z "${API_URL}" || "${API_URL}" == "None" ]]; then
-  die "no API URL - run make deploy-backend first, or set FRONTEND_API_URL in .env"
-fi
+# deployed bundle should be compiled against. BACKEND_URL is.
+API_URL="${BACKEND_URL:-}"
+API_URL="${API_URL%/}"
+[[ -n "${API_URL}" ]] || die "BACKEND_URL is not set in .env - run make deploy-backend first"
 
 log "building against ${API_URL}"
 
-if [[ "${API_URL}" == http://* ]]; then
-  warn ""
-  warn "  ${API_URL} is plain HTTP, and CloudFront only serves HTTPS."
-  warn "  Browsers block HTTPS pages calling HTTP APIs, so the deployed site"
-  warn "  will load but every request to the API will fail as mixed content."
-  warn ""
-  warn "  Fix it first with:  make domain DOMAIN=api.example.com"
-  warn ""
-fi
+# The function URL is always HTTPS; plain HTTP here means a hand-edited .env.
+[[ "${API_URL}" == https://* ]] \
+  || die "BACKEND_URL must be https:// - browsers block an HTTPS page calling HTTP"
 
 # --- infrastructure ---------------------------------------------------------
 
@@ -90,9 +80,8 @@ if ! aws cloudformation deploy \
   --template-file "${TEMPLATE}" \
   --parameter-overrides \
     "ProjectName=${PROJECT_NAME}" \
-    "PriceClass=${CLOUDFRONT_PRICE_CLASS:-PriceClass_100}" \
   --no-fail-on-empty-changeset \
-  --tags "project=${PROJECT_NAME}" "component=frontend"; then
+  --tags "PROJECT_NAME=${PROJECT_NAME}"; then
   warn "deploy failed - most recent failure reasons:"
   aws cloudformation describe-stack-events --stack-name "${STACK_NAME}" \
     --max-items 40 \
@@ -156,11 +145,7 @@ echo "  api        ${API_URL}"
 echo "  bucket     s3://${BUCKET}"
 echo
 
-if [[ "${API_URL}" == http://* ]]; then
-  warn "the API is still plain HTTP - the site will load but its data will not"
-else
-  echo "Now allow the site's origin through CORS:"
-  echo
-  echo "  API_CORS_ORIGINS=${SITE_URL}   in .env, then: make deploy-backend"
-  echo
-fi
+echo "Now allow the site's origin through CORS:"
+echo
+echo "  API_CORS_ORIGINS=${SITE_URL}   in .env, then: make deploy-backend"
+echo

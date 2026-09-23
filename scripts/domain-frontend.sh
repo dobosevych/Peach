@@ -1,8 +1,11 @@
 #!/usr/bin/env bash
-# Put a custom domain, with HTTPS, in front of the deployed backend.
+# Put a custom domain, with HTTPS, on the deployed frontend's CloudFront
+# distribution. Only the frontend gets a custom domain - the API stays on its
+# Lambda function URL - and it is assigned here, separately from
+# `make deploy-frontend`, which never touches the domain settings.
 #
-#   scripts/domain-backend.sh cert     request + DNS-validate an ACM certificate
-#   scripts/domain-backend.sh domain   the above, then deploy with it attached
+#   scripts/domain-frontend.sh cert     request + DNS-validate an ACM certificate
+#   scripts/domain-frontend.sh domain   the above, then attach it to the distribution
 #
 # Both are idempotent: an existing certificate for the domain is reused rather
 # than re-requested, and re-running after DNS is in place just re-checks.
@@ -16,16 +19,21 @@ esac
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 ENV_FILE="${ROOT}/.env"
+TEMPLATE="${ROOT}/infra/frontend.yaml"
 
 log() { printf '\033[36m==>\033[0m %s\n' "$*"; }
 warn() { printf '\033[33m==>\033[0m %s\n' "$*" >&2; }
 die() { printf '\033[31merror:\033[0m %s\n' "$*" >&2; exit 1; }
 
 if [[ -f "${ENV_FILE}" ]]; then
+  # Variables already exported win over .env: `AWS_REGION=eu-central-1 make x`
+  # must not be quietly reset to the region .env names.
+  preset="$(export -p)"
   set -a
   # shellcheck disable=SC1091
   source "${ENV_FILE}"
   set +a
+  eval "${preset}"
 fi
 
 # A blank AWS_PROFILE is read as a profile literally named "", and blank keys
@@ -35,15 +43,16 @@ for var in AWS_PROFILE AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN
 done
 
 PROJECT_NAME="${PROJECT_NAME:-peach}"
-STACK_NAME="${STACK_NAME:-${PROJECT_NAME}-backend}"
-AWS_REGION="${AWS_REGION:-${AWS_DEFAULT_REGION:-}}"
-[[ -n "${AWS_REGION}" ]] || die "AWS_REGION is not set (put it in .env)"
+STACK_NAME="${FRONTEND_STACK_NAME:-${PROJECT_NAME}-frontend}"
+AWS_REGION="${AWS_REGION:-${AWS_DEFAULT_REGION:-us-east-1}}"
 export AWS_DEFAULT_REGION="${AWS_REGION}"
+# CloudFront only takes certificates from us-east-1, whatever the stack region.
+ACM_REGION=us-east-1
 
-# `make domain DOMAIN=api.example.com` wins over whatever .env remembers.
+# `make domain DOMAIN=app.example.com` wins over whatever .env remembers.
 DOMAIN="${DOMAIN:-${DOMAIN_NAME:-}}"
 DOMAIN="${DOMAIN%.}"
-[[ -n "${DOMAIN}" ]] || die "no domain - run: make ${MODE} DOMAIN=api.example.com"
+[[ -n "${DOMAIN}" ]] || die "no domain - run: make ${MODE} DOMAIN=app.example.com"
 
 for tool in aws python3; do
   command -v "${tool}" >/dev/null 2>&1 || die "${tool} is required but not installed"
@@ -75,7 +84,7 @@ PY
   log "wrote ${1} to .env"
 }
 
-# The zone for api.example.com is example.com: walk the labels and keep the
+# The zone for app.example.com is example.com: walk the labels and keep the
 # longest public zone that the domain actually sits under.
 find_hosted_zone() {
   DOMAIN="${DOMAIN}" python3 - <<'PY'
@@ -123,31 +132,31 @@ fi
 
 # --- certificate ------------------------------------------------------------
 
-CERT_ARN="$(aws acm list-certificates \
+CERT_ARN="$(aws acm list-certificates --region "${ACM_REGION}" \
   --certificate-statuses PENDING_VALIDATION ISSUED \
   --query "CertificateSummaryList[?DomainName=='${DOMAIN}']|[0].CertificateArn" \
   --output text 2>/dev/null || true)"
 
 if [[ -z "${CERT_ARN}" || "${CERT_ARN}" == "None" ]]; then
-  log "requesting an ACM certificate for ${DOMAIN} in ${AWS_REGION}"
-  CERT_ARN="$(aws acm request-certificate \
+  log "requesting an ACM certificate for ${DOMAIN} in ${ACM_REGION}"
+  CERT_ARN="$(aws acm request-certificate --region "${ACM_REGION}" \
     --domain-name "${DOMAIN}" \
     --validation-method DNS \
     --key-algorithm RSA_2048 \
-    --tags "Key=project,Value=${PROJECT_NAME}" \
+    --tags "Key=PROJECT_NAME,Value=${PROJECT_NAME}" \
     --query CertificateArn --output text)"
 else
   log "reusing the certificate already issued for ${DOMAIN}"
 fi
 
-CERT_STATUS="$(aws acm describe-certificate --certificate-arn "${CERT_ARN}" \
+CERT_STATUS="$(aws acm describe-certificate --region "${ACM_REGION}" --certificate-arn "${CERT_ARN}" \
   --query Certificate.Status --output text)"
 
 if [[ "${CERT_STATUS}" != "ISSUED" ]]; then
   # ACM takes a moment to publish the record it wants to see.
   RECORD=""
   for _ in $(seq 1 12); do
-    RECORD="$(aws acm describe-certificate --certificate-arn "${CERT_ARN}" \
+    RECORD="$(aws acm describe-certificate --region "${ACM_REGION}" --certificate-arn "${CERT_ARN}" \
       --query "Certificate.DomainValidationOptions[0].ResourceRecord.[Name,Type,Value]" \
       --output text 2>/dev/null || true)"
     [[ -n "${RECORD}" && "${RECORD}" != *"None"* ]] && break
@@ -182,7 +191,7 @@ JSON
 
   log "waiting for ACM to validate ${DOMAIN} (minutes, once DNS propagates)"
   for _ in $(seq 1 120); do
-    CERT_STATUS="$(aws acm describe-certificate --certificate-arn "${CERT_ARN}" \
+    CERT_STATUS="$(aws acm describe-certificate --region "${ACM_REGION}" --certificate-arn "${CERT_ARN}" \
       --query Certificate.Status --output text)"
     case "${CERT_STATUS}" in
       ISSUED) break ;;
@@ -197,9 +206,9 @@ fi
   || die "gave up waiting - DNS is probably not published yet, re-run when it is"
 
 log "certificate issued"
-env_set ACM_CERTIFICATE_ARN "${CERT_ARN}"
+# Only the domain is remembered. The zone and the certificate are looked up
+# again on every run, so neither needs to live in .env.
 env_set DOMAIN_NAME "${DOMAIN}"
-[[ -n "${ZONE_ID}" ]] && env_set HOSTED_ZONE_ID "${ZONE_ID}"
 
 if [[ "${MODE}" == "cert" ]]; then
   echo
@@ -209,25 +218,49 @@ fi
 
 # --- attach -----------------------------------------------------------------
 
-log "redeploying so the ALB serves HTTPS on ${DOMAIN}"
-"${ROOT}/scripts/deploy-backend.sh"
+# Only the domain parameters change; every other parameter keeps the stack's
+# current value, and the site itself is not rebuilt.
+aws cloudformation describe-stacks --stack-name "${STACK_NAME}" >/dev/null 2>&1 \
+  || die "stack ${STACK_NAME} does not exist yet - run make deploy-frontend first"
 
-ALB_DNS="$(stack_output LoadBalancerDns)"
+log "attaching ${DOMAIN} to the distribution (CloudFront takes a few minutes)"
+if ! aws cloudformation deploy \
+  --stack-name "${STACK_NAME}" \
+  --template-file "${TEMPLATE}" \
+  --parameter-overrides \
+    "DomainName=${DOMAIN}" \
+    "AcmCertificateArn=${CERT_ARN}" \
+    "HostedZoneId=${ZONE_ID}" \
+  --no-fail-on-empty-changeset \
+  --tags "PROJECT_NAME=${PROJECT_NAME}"; then
+  warn "deploy failed - most recent failure reasons:"
+  aws cloudformation describe-stack-events --stack-name "${STACK_NAME}" \
+    --max-items 40 \
+    --query 'StackEvents[?ResourceStatus==`CREATE_FAILED`||ResourceStatus==`UPDATE_FAILED`].[LogicalResourceId,ResourceStatusReason]' \
+    --output table >&2 || true
+  exit 1
+fi
+
+TARGET="$(stack_output DistributionDomainName)"
 
 if [[ -z "${ZONE_ID}" ]]; then
   echo
   if [[ "${DOMAIN}" == *.*.* ]]; then
-    echo "  Last step - point ${DOMAIN} at the load balancer:"
+    echo "  Last step - point ${DOMAIN} at CloudFront:"
     echo
     echo "    name   ${DOMAIN}"
     echo "    type   CNAME"
-    echo "    value  ${ALB_DNS}"
+    echo "    value  ${TARGET}"
   else
-    echo "  Last step - point ${DOMAIN} at ${ALB_DNS}."
+    echo "  Last step - point ${DOMAIN} at ${TARGET}."
     warn "${DOMAIN} is a zone apex, which cannot be a CNAME. Either move the"
     warn "zone to Route 53 and re-run, or use your provider's ALIAS/ANAME record."
   fi
   echo
 fi
 
-echo "  https://${DOMAIN}/health - plain HTTP now 301s to HTTPS"
+echo "  https://${DOMAIN} - the cloudfront.net name keeps working too"
+echo
+echo "Let the API accept the new origin:"
+echo
+echo "  API_CORS_ORIGINS=https://${DOMAIN}   in .env, then: make deploy-backend"

@@ -11,10 +11,14 @@ warn() { printf '\033[33m==>\033[0m %s\n' "$*" >&2; }
 die() { printf '\033[31merror:\033[0m %s\n' "$*" >&2; exit 1; }
 
 if [[ -f "${ROOT}/.env" ]]; then
+  # Variables already exported win over .env: `AWS_REGION=eu-central-1 make x`
+  # must not be quietly reset to the region .env names.
+  preset="$(export -p)"
   set -a
   # shellcheck disable=SC1091
   source "${ROOT}/.env"
   set +a
+  eval "${preset}"
 fi
 
 for var in AWS_PROFILE AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN; do
@@ -23,8 +27,7 @@ done
 
 PROJECT_NAME="${PROJECT_NAME:-peach}"
 STACK_NAME="${GITHUB_ROLE_STACK_NAME:-${PROJECT_NAME}-github-oidc}"
-AWS_REGION="${AWS_REGION:-${AWS_DEFAULT_REGION:-}}"
-[[ -n "${AWS_REGION}" ]] || die "AWS_REGION is not set (put it in .env)"
+AWS_REGION="${AWS_REGION:-${AWS_DEFAULT_REGION:-us-east-1}}"
 export AWS_DEFAULT_REGION="${AWS_REGION}"
 
 command -v aws >/dev/null 2>&1 || die "aws cli is required"
@@ -72,7 +75,7 @@ if ! aws cloudformation deploy \
     "ExistingProviderArn=${EXISTING_PROVIDER}" \
   --capabilities CAPABILITY_NAMED_IAM \
   --no-fail-on-empty-changeset \
-  --tags "project=${PROJECT_NAME}" "component=ci"; then
+  --tags "PROJECT_NAME=${PROJECT_NAME}"; then
   warn "deploy failed - most recent failure reasons:"
   aws cloudformation describe-stack-events --stack-name "${STACK_NAME}" \
     --max-items 30 \

@@ -9,10 +9,14 @@ log() { printf '\033[36m==>\033[0m %s\n' "$*"; }
 die() { printf '\033[31merror:\033[0m %s\n' "$*" >&2; exit 1; }
 
 if [[ -f "${ROOT}/.env" ]]; then
+  # Variables already exported win over .env: `AWS_REGION=eu-central-1 make x`
+  # must not be quietly reset to the region .env names.
+  preset="$(export -p)"
   set -a
   # shellcheck disable=SC1091
   source "${ROOT}/.env"
   set +a
+  eval "${preset}"
 fi
 
 for var in AWS_PROFILE AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN; do
@@ -21,8 +25,7 @@ done
 
 PROJECT_NAME="${PROJECT_NAME:-peach}"
 STACK_NAME="${FRONTEND_STACK_NAME:-${PROJECT_NAME}-frontend}"
-AWS_REGION="${AWS_REGION:-${AWS_DEFAULT_REGION:-}}"
-[[ -n "${AWS_REGION}" ]] || die "AWS_REGION is not set"
+AWS_REGION="${AWS_REGION:-${AWS_DEFAULT_REGION:-us-east-1}}"
 export AWS_DEFAULT_REGION="${AWS_REGION}"
 
 command -v aws >/dev/null 2>&1 || die "aws cli is required"
