@@ -57,11 +57,14 @@ async function request<T>(
 
 /* --- schemas mirroring the API contract in README section 5 --- */
 
+export const itemStatuses = ["todo", "in_progress", "done"] as const;
+export const itemStatusSchema = z.enum(itemStatuses);
+
 export const itemSchema = z.object({
   id: z.string(),
   name: z.string(),
   description: z.string().nullable(),
-  is_done: z.boolean(),
+  status: itemStatusSchema,
   created_at: z.string(),
   updated_at: z.string(),
 });
@@ -79,9 +82,10 @@ export const healthSchema = z.object({
 export const itemInputSchema = z.object({
   name: z.string().min(1, "Name is required").max(120, "Name is too long"),
   description: z.string().max(2000, "Description is too long").optional(),
-  is_done: z.boolean(),
+  status: itemStatusSchema,
 });
 
+export type ItemStatus = z.infer<typeof itemStatusSchema>;
 export type Item = z.infer<typeof itemSchema>;
 export type ItemList = z.infer<typeof itemListSchema>;
 export type Health = z.infer<typeof healthSchema>;

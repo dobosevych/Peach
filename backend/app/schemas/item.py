@@ -1,13 +1,16 @@
 import uuid
 from datetime import datetime
+from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field
+
+ItemStatus = Literal["todo", "in_progress", "done"]
 
 
 class ItemBase(BaseModel):
     name: str = Field(min_length=1, max_length=120)
     description: str | None = Field(default=None, max_length=2000)
-    is_done: bool = False
+    status: ItemStatus = "todo"
 
 
 class ItemCreate(ItemBase):
@@ -17,7 +20,7 @@ class ItemCreate(ItemBase):
 class ItemUpdate(BaseModel):
     name: str | None = Field(default=None, min_length=1, max_length=120)
     description: str | None = Field(default=None, max_length=2000)
-    is_done: bool | None = None
+    status: ItemStatus | None = None
 
 
 class ItemRead(ItemBase):

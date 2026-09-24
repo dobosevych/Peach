@@ -15,7 +15,7 @@ async def test_create_returns_201_and_the_item(client: AsyncClient) -> None:
     body = response.json()
     assert body["name"] == "First"
     assert body["description"] == "hello"
-    assert body["is_done"] is False
+    assert body["status"] == "todo"
     assert uuid.UUID(body["id"])
     assert body["created_at"] and body["updated_at"]
 
@@ -40,11 +40,16 @@ async def test_get_missing_returns_404(client: AsyncClient) -> None:
 
 async def test_patch_applies_partial_update(client: AsyncClient) -> None:
     created = (await client.post("/api/v1/items", json={"name": "Before"})).json()
-    response = await client.patch(f"/api/v1/items/{created['id']}", json={"is_done": True})
+    response = await client.patch(f"/api/v1/items/{created['id']}", json={"status": "in_progress"})
     assert response.status_code == 200
     body = response.json()
-    assert body["is_done"] is True
+    assert body["status"] == "in_progress"
     assert body["name"] == "Before"
+
+
+async def test_rejects_unknown_status(client: AsyncClient) -> None:
+    response = await client.post("/api/v1/items", json={"name": "Bad", "status": "blocked"})
+    assert response.status_code == 422
 
 
 async def test_patch_missing_returns_404(client: AsyncClient) -> None:

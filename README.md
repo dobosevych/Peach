@@ -210,7 +210,7 @@ Base path `/api/v1`. JSON only. Errors use FastAPI's default shape
 # ItemCreate
 name: str                      # 1..120 chars
 description: str | None = None # <= 2000 chars
-is_done: bool = False
+status: "todo" | "in_progress" | "done" = "todo"
 
 # ItemRead = ItemCreate + 
 id: uuid.UUID
@@ -219,7 +219,7 @@ updated_at: datetime
 ```
 
 `items` table: `id uuid pk default gen_random_uuid()`, `name text not null`,
-`description text`, `is_done boolean not null default false`,
+`description text`, `status varchar(20) not null default 'todo'` (checked to `todo`/`in_progress`/`done`),
 `created_at timestamptz not null default now()`, `updated_at timestamptz not null default now()`.
 
 Interactive docs at `/docs` (Swagger) and `/redoc`; the raw schema at `/openapi.json`.
@@ -230,9 +230,11 @@ Interactive docs at `/docs` (Swagger) and `/redoc`; the raw schema at `/openapi.
 
 - `/` — dashboard. Calls `/health/ready` and renders a shadcn `Badge` (green "Connected" /
   red "Unavailable"), plus a `Card` summarising item counts.
-- `/items` — the dummy CRUD screen: a shadcn `Table` of items, a "New item" `Button` opening a
-  `Dialog` with a `react-hook-form` + `zod` validated form built on `Field`, row actions for
-  edit and delete (delete confirms via `AlertDialog`), and `Sonner` toasts for outcomes.
+- `/items` — a Trello-style board in Notion styling: one column per status (To do, In progress,
+  Done). Cards drag between columns (native HTML5 drag and drop, optimistic update rolled back on
+  error); clicking a card opens a `Dialog` with a `react-hook-form` + `zod` form to edit title,
+  status and description, or delete (confirmed via `AlertDialog`). Each column has its own "New"
+  button, and `Sonner` toasts report outcomes.
 - Loading states use `Skeleton`; empty state is a centered card with a call to action; a failed
   fetch renders an `Alert` with a retry button rather than a blank page.
 

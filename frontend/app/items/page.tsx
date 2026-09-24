@@ -1,7 +1,7 @@
-import { ItemTable } from "@/components/item-table";
+import { ItemBoard } from "@/components/item-board";
 
-export const metadata = { title: "Items | Peach" };
+export const metadata = { title: "Board | Peach" };
 
 export default function ItemsPage() {
-  return <ItemTable />;
+  return <ItemBoard />;
 }

@@ -7,7 +7,7 @@ import { cn } from "@/lib/utils";
 
 const links = [
   { href: "/", label: "Dashboard" },
-  { href: "/items", label: "Items" },
+  { href: "/items", label: "Board" },
 ];
 
 export function SiteHeader() {

@@ -2,12 +2,12 @@
 
 import { zodResolver } from "@hookform/resolvers/zod";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
+import { Trash2 } from "lucide-react";
 import { useEffect } from "react";
 import { Controller, useForm } from "react-hook-form";
 import { toast } from "sonner";
 
 import { Button } from "@/components/ui/button";
-import { Checkbox } from "@/components/ui/checkbox";
 import {
   Dialog,
   DialogContent,
@@ -19,22 +19,41 @@ import {
 import { Field, FieldError, FieldLabel } from "@/components/ui/field";
 import { Input } from "@/components/ui/input";
 import { Textarea } from "@/components/ui/textarea";
-import { api, itemInputSchema, type Item, type ItemInput } from "@/lib/api";
+import {
+  api,
+  itemInputSchema,
+  itemStatuses,
+  type Item,
+  type ItemInput,
+  type ItemStatus,
+} from "@/lib/api";
+import { statusMeta } from "@/lib/item-status";
+import { cn } from "@/lib/utils";
 
 type Props = {
   open: boolean;
   onOpenChange: (open: boolean) => void;
   /** Present when editing, absent when creating. */
   item?: Item | null;
+  /** Column a new card starts in. */
+  defaultStatus?: ItemStatus;
+  /** Shown only when editing; the caller owns the confirmation. */
+  onDelete?: (item: Item) => void;
 };
 
-export function ItemFormDialog({ open, onOpenChange, item }: Props) {
+export function ItemFormDialog({
+  open,
+  onOpenChange,
+  item,
+  defaultStatus = "todo",
+  onDelete,
+}: Props) {
   const queryClient = useQueryClient();
   const isEditing = Boolean(item);
 
   const form = useForm<ItemInput>({
     resolver: zodResolver(itemInputSchema),
-    defaultValues: { name: "", description: "", is_done: false },
+    defaultValues: { name: "", description: "", status: defaultStatus },
   });
 
   useEffect(() => {
@@ -42,16 +61,16 @@ export function ItemFormDialog({ open, onOpenChange, item }: Props) {
     form.reset({
       name: item?.name ?? "",
       description: item?.description ?? "",
-      is_done: item?.is_done ?? false,
+      status: item?.status ?? defaultStatus,
     });
-  }, [open, item, form]);
+  }, [open, item, defaultStatus, form]);
 
   const mutation = useMutation({
     mutationFn: (values: ItemInput) =>
       item ? api.updateItem(item.id, values) : api.createItem(values),
     onSuccess: async () => {
       await queryClient.invalidateQueries({ queryKey: ["items"] });
-      toast.success(isEditing ? "Item updated" : "Item created");
+      toast.success(isEditing ? "Task updated" : "Task created");
       onOpenChange(false);
     },
     onError: (error: Error) => toast.error(error.message),
@@ -59,13 +78,13 @@ export function ItemFormDialog({ open, onOpenChange, item }: Props) {
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent className="sm:max-w-md">
+      <DialogContent className="sm:max-w-lg">
         <DialogHeader>
-          <DialogTitle>{isEditing ? "Edit item" : "New item"}</DialogTitle>
+          <DialogTitle>{isEditing ? "Edit task" : "New task"}</DialogTitle>
           <DialogDescription>
             {isEditing
-              ? "Update this placeholder record."
-              : "Placeholder record - the real domain model replaces this later."}
+              ? "Change the details or move it to another column."
+              : "Add a card to the board."}
           </DialogDescription>
         </DialogHeader>
 
@@ -74,18 +93,60 @@ export function ItemFormDialog({ open, onOpenChange, item }: Props) {
           onSubmit={form.handleSubmit((values) => mutation.mutate(values))}
         >
           <Field data-invalid={Boolean(form.formState.errors.name)}>
-            <FieldLabel htmlFor="name">Name</FieldLabel>
+            <FieldLabel htmlFor="name">Title</FieldLabel>
             <Input id="name" autoComplete="off" {...form.register("name")} />
             {form.formState.errors.name && (
               <FieldError errors={[form.formState.errors.name]} />
             )}
           </Field>
 
+          <Field>
+            <FieldLabel id="status-label">Status</FieldLabel>
+            <Controller
+              control={form.control}
+              name="status"
+              render={({ field }) => (
+                <div
+                  role="radiogroup"
+                  aria-labelledby="status-label"
+                  className="flex flex-wrap gap-1.5"
+                >
+                  {itemStatuses.map((status) => {
+                    const meta = statusMeta[status];
+                    const selected = field.value === status;
+                    return (
+                      <button
+                        key={status}
+                        type="button"
+                        role="radio"
+                        aria-checked={selected}
+                        onClick={() => field.onChange(status)}
+                        className={cn(
+                          "inline-flex h-7 items-center gap-1.5 rounded-md px-2.5 text-sm font-medium transition",
+                          selected
+                            ? cn(meta.pill, "ring-1 ring-foreground/15")
+                            : "text-muted-foreground hover:bg-accent",
+                        )}
+                      >
+                        <span
+                          aria-hidden
+                          className={cn("size-2 rounded-full", meta.dot)}
+                        />
+                        {meta.label}
+                      </button>
+                    );
+                  })}
+                </div>
+              )}
+            />
+          </Field>
+
           <Field data-invalid={Boolean(form.formState.errors.description)}>
             <FieldLabel htmlFor="description">Description</FieldLabel>
             <Textarea
               id="description"
-              rows={3}
+              rows={4}
+              placeholder="Add more detail..."
               {...form.register("description")}
             />
             {form.formState.errors.description && (
@@ -93,40 +154,40 @@ export function ItemFormDialog({ open, onOpenChange, item }: Props) {
             )}
           </Field>
 
-          <Field orientation="horizontal">
-            <Controller
-              control={form.control}
-              name="is_done"
-              render={({ field }) => (
-                <Checkbox
-                  id="is_done"
-                  checked={field.value}
-                  onCheckedChange={(checked) =>
-                    field.onChange(checked === true)
-                  }
-                />
-              )}
-            />
-            <FieldLabel htmlFor="is_done">Done</FieldLabel>
-          </Field>
-
-          <DialogFooter>
-            <Button
-              type="button"
-              size="lg"
-              variant="outline"
-              onClick={() => onOpenChange(false)}
-              disabled={mutation.isPending}
-            >
-              Cancel
-            </Button>
-            <Button type="submit" size="lg" disabled={mutation.isPending}>
-              {mutation.isPending
-                ? "Saving..."
-                : isEditing
-                  ? "Save changes"
-                  : "Create"}
-            </Button>
+          <DialogFooter className="sm:justify-between">
+            {item && onDelete ? (
+              <Button
+                type="button"
+                size="lg"
+                variant="ghost"
+                className="text-destructive hover:text-destructive"
+                onClick={() => onDelete(item)}
+                disabled={mutation.isPending}
+              >
+                <Trash2 data-icon="inline-start" className="size-4" />
+                Delete
+              </Button>
+            ) : (
+              <span />
+            )}
+            <div className="flex gap-2">
+              <Button
+                type="button"
+                size="lg"
+                variant="outline"
+                onClick={() => onOpenChange(false)}
+                disabled={mutation.isPending}
+              >
+                Cancel
+              </Button>
+              <Button type="submit" size="lg" disabled={mutation.isPending}>
+                {mutation.isPending
+                  ? "Saving..."
+                  : isEditing
+                    ? "Save changes"
+                    : "Create"}
+              </Button>
+            </div>
           </DialogFooter>
         </form>
       </DialogContent>

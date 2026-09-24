@@ -20,3 +20,7 @@ if (!Element.prototype.hasPointerCapture) {
   Element.prototype.setPointerCapture = () => {};
   Element.prototype.releasePointerCapture = () => {};
 }
+
+// jsdom has no DragEvent, so drag events would lose their pointer coordinates.
+globalThis.DragEvent ??=
+  class extends MouseEvent {} as unknown as typeof DragEvent;

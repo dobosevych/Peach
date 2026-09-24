@@ -41,8 +41,8 @@ export default function DashboardPage() {
 
         <Card>
           <CardHeader>
-            <CardTitle>Items</CardTitle>
-            <CardDescription>The placeholder resource</CardDescription>
+            <CardTitle>Tasks</CardTitle>
+            <CardDescription>Cards on the board, by status</CardDescription>
           </CardHeader>
           <CardContent className="grid gap-5">
             <ItemSummary />
@@ -53,7 +53,7 @@ export default function DashboardPage() {
               className="justify-self-start"
             >
               <Link href="/items">
-                Manage items
+                Open board
                 <ArrowRight data-icon="inline-end" />
               </Link>
             </Button>

@@ -24,7 +24,7 @@ export function makeItem(overrides: Partial<Item> = {}): Item {
     id: "11111111-1111-1111-1111-111111111111",
     name: "Example",
     description: "An example item",
-    is_done: false,
+    status: "todo",
     created_at: "2026-01-01T00:00:00Z",
     updated_at: "2026-01-01T00:00:00Z",
     ...overrides,
