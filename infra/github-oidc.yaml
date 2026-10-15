@@ -79,7 +79,7 @@ Resources:
                 token.actions.githubusercontent.com:aud: sts.amazonaws.com
               StringLike:
                 # And without this, any repository on GitHub would do.
-                token.actions.githubusercontent.com:sub: !Sub "repo:${GitHubRepo}:${SubjectClaim}"
+                token.actions.githubusercontent.com:sub: "repo:oryavchik@245420091/Peach@1400082890:ref:refs/heads/main"
       Policies:
         # Deliberately not AdministratorAccess. Scoped to the services the
         # deploy actually drives, and to this project's names where the API
@@ -197,6 +197,46 @@ Resources:
                   - secretsmanager:TagResource
                   - secretsmanager:UpdateSecret
                 Resource: !Sub "arn:aws:secretsmanager:*:${AWS::AccountId}:secret:${ProjectName}/*"
+
+              - Sid: FrontendBucket
+                Effect: Allow
+                Action:
+                  - s3:CreateBucket
+                  - s3:DeleteBucket
+                  - s3:GetBucketLocation
+                  - s3:GetBucketPolicy
+                  - s3:PutBucketPolicy
+                  - s3:DeleteBucketPolicy
+                  - s3:GetBucketTagging
+                  - s3:PutBucketTagging
+                  - s3:ListBucket
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:DeleteObject
+                Resource:
+                  - !Sub "arn:aws:s3:::${ProjectName}-frontend-*"
+                  - !Sub "arn:aws:s3:::${ProjectName}-frontend-*/*"
+
+              - Sid: CloudFront
+                Effect: Allow
+                Action:
+                  - cloudfront:CreateDistribution
+                  - cloudfront:GetDistribution
+                  - cloudfront:GetDistributionConfig
+                  - cloudfront:UpdateDistribution
+                  - cloudfront:DeleteDistribution
+                  - cloudfront:CreateInvalidation
+                  - cloudfront:GetInvalidation
+                  - cloudfront:TagResource
+                  - cloudfront:UntagResource
+                  - cloudfront:ListTagsForResource
+                  - cloudfront:CreateFunction
+                  - cloudfront:GetFunction
+                  - cloudfront:DescribeFunction
+                  - cloudfront:UpdateFunction
+                  - cloudfront:PublishFunction
+                  - cloudfront:DeleteFunction
+                Resource: "*"
 
               - Sid: Logs
                 Effect: Allow

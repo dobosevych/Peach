@@ -255,8 +255,6 @@ params = {
     "DbMinCapacity": os.environ["DB_MIN_CAPACITY"],
     "DbMaxCapacity": os.environ["DB_MAX_CAPACITY"],
     "DbSecondsUntilAutoPause": os.environ["DB_SECONDS_UNTIL_AUTO_PAUSE"],
-    "AppEnv": os.environ["APP_ENV"],
-    "LogLevel": os.environ["LOG_LEVEL"],
     "CorsOrigins": os.environ["CORS_ORIGINS"],
     "CognitoUserPoolId": os.environ["COGNITO_USER_POOL_ID"],
     "CognitoClientId": os.environ["COGNITO_CLIENT_ID"],
